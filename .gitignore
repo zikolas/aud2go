@@ -6,3 +6,6 @@
 *.LOG
 *.log
 *.map
+
+# exception: the shipped prebuilt enabler
+!AUD2GO.EXE

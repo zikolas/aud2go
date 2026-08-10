@@ -71,7 +71,8 @@ AUD2GO stops at a configured socket and never touches the audio silicon.
 
 ## Building
 
-On the DOS box with OpenWatcom (16-bit real mode, C89):
+A prebuilt `AUD2GO.EXE` is included (16-bit real mode, runs on anything).
+To rebuild on the DOS box with OpenWatcom (16-bit real mode, C89):
 
 ```
 BLD.BAT AUD2GO
