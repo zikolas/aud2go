@@ -21,7 +21,7 @@
 #include <conio.h>
 #include <dos.h>
 
-#define VERSION "1.1"
+#define VERSION "1.2"
 
 /* ---- Yenta CardBus socket registers, memory mapped at the socket base ---- */
 #define CB_SOCKET_EVENT     0x00
@@ -65,12 +65,17 @@
 #define CREATIVE_VENDOR     0x1102
 #define CA0108_DEVICE       0x0008
 #define ZSNB_SUBSYS         0x20011102UL
+/* Before the chip's wake-up its config space is not fully stable: on a TI
+ * bridge (ThinkPad 560X) the same card's subsystem ID reads 20011102 after
+ * wake-up but 20001102 before it. Accept the pre-wake reading too. */
+#define ZSNB_SUBSYS_PREWAKE 0x20001102UL
 
 
 static unsigned g_sockseg = 0xD000;   /* real-mode segment for socket regs */
 static unsigned g_iobase  = 0x1400;
 static int      g_verbose = 0;
 static int      g_force   = 0;
+static int      g_irq     = -1;   /* /IRQ=n override */
 
 struct bridge_s { unsigned bus, dev, fn; };
 static struct bridge_s g_br[8];
@@ -179,9 +184,16 @@ static void cfg_wd(unsigned bus, unsigned devfn, unsigned reg, unsigned long v)
 
 /* -------------------------------------------------- socket register MMIO */
 
+/* Each bridge gets its own 4 kB page inside the D-segment window. Mapping
+ * two sockets at the SAME address (the old scheme) made the second socket's
+ * reads land on the first one's registers -- the "phantom card in the empty
+ * socket" bug on multi-socket TI bridges (found on a ThinkPad 560X: an
+ * already-mapped socket 1 answered socket 2's reads). */
+static unsigned g_sockoff = 0;
+
 static unsigned long sock_rd(unsigned reg)
 {
-    unsigned char __far *p = (unsigned char __far *)MK_FP(g_sockseg, reg);
+    unsigned char __far *p = (unsigned char __far *)MK_FP(g_sockseg, g_sockoff + reg);
     unsigned long v = 0;
     int i;
 
@@ -192,7 +204,7 @@ static unsigned long sock_rd(unsigned reg)
 
 static void sock_wr(unsigned reg, unsigned long v)
 {
-    unsigned char __far *p = (unsigned char __far *)MK_FP(g_sockseg, reg);
+    unsigned char __far *p = (unsigned char __far *)MK_FP(g_sockseg, g_sockoff + reg);
     int i;
 
     for (i = 0; i < 4; i++) {
@@ -265,13 +277,28 @@ static unsigned bdevfn(int i)
     return (g_br[i].dev << 3) | g_br[i].fn;
 }
 
-/* map a bridge's socket registers so we can read the card-detect state */
+/* Map a bridge's socket registers and read the card-detect state.
+ * Validated: the BAR must read back, and the state must be stable across two
+ * reads and not look like an open bus -- on the TI PCI12xx bridges a socket
+ * window that silently failed to map floats a value that can pass the
+ * card-present test (the ThinkPad 560X phantom-card bug). */
 static unsigned long socket_state(int i)
 {
+    unsigned long a, b;
+
     disable_windows(g_br[i].bus, bdevfn(i));
-    cfg_wd(g_br[i].bus, bdevfn(i), CFG_SOCKBASE, (unsigned long)g_sockseg << 4);
+    g_sockoff = (unsigned)i << 12;          /* own page per socket */
+    cfg_wd(g_br[i].bus, bdevfn(i), CFG_SOCKBASE,
+           ((unsigned long)g_sockseg << 4) + g_sockoff);
     cfg_ww(g_br[i].bus, bdevfn(i), CFG_CMD, 0x0002);   /* memory decode only */
-    return sock_rd(CB_SOCKET_STATE);
+    if ((cfg_rd(g_br[i].bus, bdevfn(i), CFG_SOCKBASE) & 0xFFFFF000UL)
+        != (((unsigned long)g_sockseg << 4) + g_sockoff))
+        return 0xFFFFFFFFUL;                /* window did not map: no trust */
+    a = sock_rd(CB_SOCKET_STATE);
+    b = sock_rd(CB_SOCKET_STATE);
+    if (a != b || a == 0xFFFFFFFFUL || a == 0x00000000UL)
+        return 0xFFFFFFFFUL;
+    return a;
 }
 
 static void socket_unmap(int i)
@@ -284,6 +311,8 @@ static void socket_unmap(int i)
  * socket every other status bit floats and must not be believed. */
 static int card_seated(unsigned long st)
 {
+    if (st == 0xFFFFFFFFUL)                 /* unreadable socket window */
+        return 0;
     return (st & (CB_CDETECT1 | CB_CDETECT2)) == 0;
 }
 
@@ -332,6 +361,7 @@ static void usage(void)
     printf("  AUD2GO /V        verbose (show every step)\n\n");
     printf("  /S=n     use socket n (1-based) instead of searching\n");
     printf("  /IO=nnn  I/O base to assign          (default %04X)\n", g_iobase);
+    printf("  /IRQ=n   force the interrupt line (when the BIOS left it unset)\n");
     printf("  /SB=nnn  segment for socket registers (default %04X)\n", g_sockseg);
     printf("  /FORCE   reconfigure even if a card is already enabled\n");
 }
@@ -347,7 +377,9 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (argv[i][0] != '/' && argv[i][0] != '-')
             continue;
-        if (!strnicmp(argv[i] + 1, "IO=", 3))
+        if (!strnicmp(argv[i] + 1, "IRQ=", 4))
+            g_irq = (int)strtoul(argv[i] + 5, NULL, 10);
+        else if (!strnicmp(argv[i] + 1, "IO=", 3))
             g_iobase = (unsigned)strtoul(argv[i] + 4, NULL, 16);
         else if (!strnicmp(argv[i] + 1, "SB=", 3))
             g_sockseg = (unsigned)strtoul(argv[i] + 4, NULL, 16);
@@ -440,6 +472,8 @@ int main(int argc, char **argv)
     }
 
     /* ---- power the socket ---- */
+    g_sockoff = (unsigned)target << 12;     /* our window, whichever socket
+                                             * the scan looked at last */
     cfg_ww(g_br[target].bus, devfn, CFG_BRIDGECTL,
            cfg_rw(g_br[target].bus, devfn, CFG_BRIDGECTL) | BCTL_CRST);
     if (st & CB_3VCARD)
@@ -465,17 +499,74 @@ int main(int argc, char **argv)
     }
     cfg_ww(g_br[target].bus, devfn, CFG_BRIDGECTL,
            cfg_rw(g_br[target].bus, devfn, CFG_BRIDGECTL) & ~BCTL_CRST);
-    tick_delay(4);
+    tick_delay(8);
 
     /* ---- find the card on the secondary bus ---- */
     cbbus   = cfg_rb(g_br[target].bus, devfn, CFG_CBBUS);
     intline = cfg_rb(g_br[target].bus, devfn, CFG_INTLINE);
+
+    /* A BIOS that never configured the socket leaves INTLINE at 255 even
+     * though the PIRQ lines are routed (the 560X routes all four to IRQ 11).
+     * On an Intel 430TX, ask the PIIX4's PIRQ router directly; /IRQ=n wins
+     * over everything. */
+    if (g_irq >= 0)
+        intline = (unsigned char)g_irq;
+    else if ((intline == 0 || intline > 15)
+             && cfg_rw(0, 0x00, 0x00) == 0x8086
+             && cfg_rw(0, 0x00, 0x02) == 0x7100) {
+        /* 430TX with the socket left unconfigured. An IRQ the PIIX4's PIRQ
+         * router drives internally (USB etc.) can never be won by the
+         * bridge's ISA-mode output -- measured on a 560X: IRQ 11 (all four
+         * PIRQs) never delivered, IRQ 10 works. Pick the first free line
+         * the router does NOT own. */
+        static const unsigned char cand[4] = { 10, 5, 15, 3 };
+        unsigned char used[4];
+        int c, k, clash;
+        for (k = 0; k < 4; k++) {
+            unsigned char rt = cfg_rb(0, 0x08, 0x60 + k);
+            used[k] = (rt & 0x80) ? 0 : (rt & 0x0F);
+        }
+        for (c = 0; c < 4; c++) {
+            clash = 0;
+            for (k = 0; k < 4; k++)
+                if (used[k] == cand[c])
+                    clash = 1;
+            if (!clash) {
+                intline = cand[c];
+                break;
+            }
+        }
+        if (intline <= 15) {
+            cfg_wb(g_br[target].bus, devfn, CFG_INTLINE, intline);
+            if (g_verbose)
+                printf("  INTLINE unset; picked free ISA IRQ %d "
+                       "(PIRQ router owns %d/%d/%d/%d)\n", intline,
+                       used[0], used[1], used[2], used[3]);
+        }
+    }
     dev = 0xFFFF;
     for (i = 0; i < 32; i++) {
         ven = cfg_rw(cbbus, i << 3, 0x00);
         if (ven != 0xFFFF && ven != 0x0000) {
             dev = i;
             break;
+        }
+    }
+
+    /* Config reads can flicker for a moment after reset comes off (measured
+     * on a 560X: the same card's subsystem ID read 20001102 then 20011102).
+     * Read identity registers until two consecutive passes agree. */
+    if (dev != 0xFFFF) {
+        unsigned long id1, id2, ss1, ss2;
+        int tries;
+        for (tries = 0; tries < 20; tries++) {
+            id1 = cfg_rd(cbbus, dev << 3, 0x00);
+            ss1 = cfg_rd(cbbus, dev << 3, 0x2C);
+            id2 = cfg_rd(cbbus, dev << 3, 0x00);
+            ss2 = cfg_rd(cbbus, dev << 3, 0x2C);
+            if (id1 == id2 && ss1 == ss2)
+                break;
+            tick_delay(1);
         }
     }
     if (dev == 0xFFFF) {
@@ -487,7 +578,7 @@ int main(int argc, char **argv)
     did    = cfg_rw(cbbus, dev << 3, 0x02);
     subsys = cfg_rd(cbbus, dev << 3, 0x2C);
     known  = (ven == CREATIVE_VENDOR && did == CA0108_DEVICE &&
-              subsys == ZSNB_SUBSYS);
+              (subsys == ZSNB_SUBSYS || subsys == ZSNB_SUBSYS_PREWAKE));
 
     if (g_verbose)
         printf("  bus %02X dev %02X: %04X:%04X subsys %08lX class %02X%02X\n",
@@ -514,6 +605,17 @@ int main(int argc, char **argv)
     }
     cfg_wd(cbbus, dev << 3, 0x10, (unsigned long)g_iobase | 1UL);
     cfg_wb(cbbus, dev << 3, 0x3C, intline);
+
+    /* In the (default) parallel-ISA interrupt mode of TI-class bridges the
+     * CardBus functional interrupt is delivered on the ISA IRQ named in the
+     * ExCA interrupt-select nibble -- without this the card asserts and the
+     * PIC never hears it (the 560X silence). Harmless on bridges that route
+     * via PCI INT instead. */
+    if (intline >= 3 && intline <= 15) {
+        unsigned char __far *ex =
+            (unsigned char __far *)MK_FP(g_sockseg, g_sockoff + 0x800 + 3);
+        *ex = (unsigned char)((*ex & 0xF0) | intline);
+    }
     cfg_wb(cbbus, dev << 3, 0x0D, 0x20);
 
     iolim = g_iobase + sz - 1;
